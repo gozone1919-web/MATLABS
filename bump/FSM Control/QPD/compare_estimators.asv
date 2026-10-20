@@ -1,0 +1,236 @@
+%% compare_estimators.m
+% 세 알고리즘 오차 곡선 비교
+% 1. 차분합       X̂ = k·(-XDiff/SUM)            k: 중심 calibration
+% 2. log-ratio    X̂ = k·ln(우/좌)                k: 중심 calibration
+% 3. hybrid       X̂ = r0·[α·δ1 + (1-α)·δ2]      논문식 그대로, 이후 중심 기울기 정규화
+%
+% 섹션
+%   1. 파라미터
+%   2. 중심 calibration (k, hybrid 정규화 이득)
+%   3. 1D 오차 곡선 (Y = 0), r0 sensitivity
+%   4. Y 오프셋에 따른 X 추정 교차 영향
+%   5. noise sweep (valid RMS error + invalid 비율, nSigma 후보별)
+%
+% 거리 L, FSM 각도는 아직 연결하지 않음. 입력은 "검출면 위 광점 위치 X, Y [mm]".
+
+clear; clc; close all;
+rng(1);
+
+%% 1. 파라미터 -------------------------------------------------------------
+% PDQ80A
+det.R    = 3.9;     % [mm] 센서 반경 (Ø7.8 mm, PDQ80A data sheet)
+det.gap  = 0;       % [mm] gap 미확인 -> 0 = 이상적 조건. 값 확인 후 교체
+det.resp = 0.4;     % [A/W] @633 nm (데이터시트 그래프 판독값)
+det.G    = 1e4;     % [V/A] 10 kV/A (데이터시트)
+
+% 광량: 실제 레이저 출력 미확인이라 SUM 목표 전압으로 지정
+SUM_target = 1.0;                              % [V]
+P_det = SUM_target/(det.resp*det.G);           % [W] 검출면 입사 파워 (SUM=1 V -> 0.25 mW)
+
+% sensitivity study 변수 (설계값 아님)
+r0_list = [0.5 1.0 1.5 2.0];   % [mm] 1/e^2 빔 반경
+alpha   = 0.9;                 % hybrid 가중치 (논문값)
+
+% 스캔 범위
+Xs = linspace(-3.5, 3.5, 701); % [mm]
+
+% calibration 구간: |X| <= cal_frac·r0 에서 선형 피팅
+cal_frac = 0.1;
+
+% 선형 범위 판정: |X̂ - X| <= tol_rel·|X| 가 중심부터 연속으로 유지되는 최대 |X|
+tol_rel = 0.05;
+
+% 유효 기울기 범위 판정: 국부 기울기 dX̂/dX >= slope_frac (정규화 후 중심 기울기 = 1)
+%   기울기가 이 값보다 작아지면 폐루프 이득이 그만큼 떨어짐 -> capture 성능과 직결
+slope_frac = 0.1;
+
+methods = {'DoS', 'LogRatio', 'Hybrid'};
+nm = numel(methods); nr = numel(r0_list);
+
+%% 2~3. calibration + 1D 오차 곡선 ----------------------------------------
+res = struct();
+figure('Name', '1D error (normalized)', 'Position', [100 100 1100 750]);
+for ir = 1:nr
+    beam.r0 = r0_list(ir); beam.P = P_det;
+
+    [gain_raw, gain] = calibrate(beam, det, alpha, cal_frac);
+
+    sig = qpd_model(Xs, zeros(size(Xs)), beam, det);
+    Xh = estimate_all(sig, beam.r0, alpha, gain);
+
+    for m = 1:nm
+        e = Xh(m,:) - Xs;
+        res.slope_raw(ir, m) = gain_raw(m);
+        res.lin_range(ir, m) = linear_range(Xs, Xh(m,:), tol_rel);
+        res.slope_range(ir, m) = slope_range(Xs, Xh(m,:), slope_frac);
+        in1 = abs(Xs) <= beam.r0;
+        res.rmse_r0(ir, m) = sqrt(mean(e(in1).^2));
+    end
+
+    subplot(2, 2, ir);
+    plot(Xs, Xh(1,:) - Xs, Xs, Xh(2,:) - Xs, Xs, Xh(3,:) - Xs, 'LineWidth', 1.2);
+    grid on; xlabel('X true [mm]'); ylabel('X̂ - X [mm]');
+    title(sprintf('r_0 = %.1f mm (중심 기울기 정규화)', beam.r0));
+    ylim([-1 1]*beam.r0); xline(det.R, 'k:'); xline(-det.R, 'k:');
+    if ir == 1, legend(methods, 'Location', 'best'); end
+end
+
+fprintf('\n=== 정규화 전 중심 기울기 dX̂/dX (DoS·LogRatio는 δ 기울기 [1/mm], Hybrid는 논문식 그대로 [-]) ===\n');
+print_table(r0_list, methods, res.slope_raw, '%10.3f');
+fprintf('\n=== 선형 범위 |X| [mm] (상대오차 <= %.0f%%) ===\n', tol_rel*100);
+print_table(r0_list, methods, res.lin_range, '%10.3f');
+fprintf('\n=== 유효 기울기 범위 |X| [mm] (국부 기울기 >= %.2f, 스캔 끝 %.2f mm면 범위 밖까지 유지) ===\n', slope_frac, max(Xs));
+print_table(r0_list, methods, res.slope_range, '%10.3f');
+fprintf('\n=== RMSE [mm], |X| <= r0 구간 ===\n');
+print_table(r0_list, methods, res.rmse_r0, '%10.4f');
+
+%% 4. Y 오프셋에 따른 X 추정 교차 영향 (r0 = 1 mm) --------------------------
+beam.r0 = 1.0; beam.P = P_det;
+[~, gain] = calibrate(beam, det, alpha, cal_frac);
+Yoff = [0 0.5 1.0 2.0]*beam.r0;
+figure('Name', 'X error vs Y offset', 'Position', [150 150 1100 350]);
+for m = 1:nm
+    subplot(1, nm, m); hold on;
+    for iy = 1:numel(Yoff)
+        sig = qpd_model(Xs, Yoff(iy)*ones(size(Xs)), beam, det);
+        Xh = estimate_all(sig, beam.r0, alpha, gain);
+        plot(Xs, Xh(m,:) - Xs, 'LineWidth', 1.1);
+    end
+    grid on; ylim([-1 1]); xlabel('X true [mm]'); ylabel('X̂ - X [mm]');
+    title(sprintf('%s, r_0 = %.1f mm', methods{m}, beam.r0));
+    legend(compose('Y = %.1f mm', Yoff), 'Location', 'best');
+end
+
+%% 5. noise sweep -----------------------------------------------------------
+% 잡음 모델: sigma_quad (네 사분면 전압에 서로 독립인 백색 가우시안 잡음 [V])
+%   이론적 QPD 사분면 잡음 연구용. 실측 KPA101 잡음은 sigma_out으로 따로 넣고,
+%   두 모델을 동시에 쓰지 않는다 (qpd_model에서 에러 처리).
+% 이 스크립트의 SNR 정의 (임의로 정한 비교 기준, 논문 정의 아님):
+%   SNR_dB = 20·log10( SUM_target / sigma_quad )      SUM_target = 1 V
+%   예) 40 dB -> sigma_quad = 10 mV,  60 dB -> 1 mV
+%   Sensors 2022 log-ratio 논문의 SNR(= I_S^2 / 4·I_NDC^2, DC 잡음 기준)과 정의가 다르므로
+%   수치를 그 논문과 직접 비교하지 말 것.
+%
+% 유효 판정 하한: nSigma × (해당 채널 잡음 σ)
+%   sigma_quad 모델에서 채널 σ (사분면 잡음 독립 가정):
+%     σ_SUM  = 2·sigma_quad        (4개 사분면 합)
+%     σ_half = √2·sigma_quad       (2개 사분면 합)
+%   실험에서는 이 식 대신 dark 데이터로 직접 계산:
+%     σ_SUM  = std(SUM),  σ_half = std((SUM ± XDiff)/2), std((SUM ± YDiff)/2) 중 최대
+%   nSigma는 고정하지 않고 후보값을 함께 돌린다. dark 데이터 확보 후 결정.
+%
+% 평가값
+%   valid RMS  : valid 샘플만으로 계산한 잡음 오차 RMS, X̂_noisy - X̂_clean
+%                (비선형 오차는 섹션 3에서 따로 봤으므로 여기서는 분리)
+%   invalid 비율: 하한에 걸린 샘플 비율. valid RMS는 나쁜 샘플이 빠진 값이므로
+%                반드시 invalid 비율과 같이 볼 것.
+SNR_dB = [20 30 40 50 60];
+nSigma_list = [3 5];                      % 후보값 (확정값 아님)
+r0_noise = 1.0;
+Xn = linspace(-r0_noise, r0_noise, 21);   % 평가 위치 |X| <= r0
+Ntrial = 200;
+
+beam.r0 = r0_noise; beam.P = P_det;
+[~, gain] = calibrate(beam, det, alpha, cal_frac);
+Xrep = repmat(Xn, Ntrial, 1);
+Xh_clean = estimate_all(qpd_model(Xrep, zeros(size(Xrep)), beam, det), beam.r0, alpha, gain, 0, 0);
+
+nS = numel(SNR_dB); nN = numel(nSigma_list);
+rms_valid = NaN(nS, nm, nN);
+inv_ratio = zeros(nS, nm, nN);
+for in = 1:nN
+    for is = 1:nS
+        noise = struct('sigma_quad', SUM_target/10^(SNR_dB(is)/20));
+        SUM_min  = nSigma_list(in)*2*noise.sigma_quad;
+        half_min = nSigma_list(in)*sqrt(2)*noise.sigma_quad;
+
+        sig = qpd_model(Xrep, zeros(size(Xrep)), beam, det, noise);
+        [Xh, V] = estimate_all(sig, beam.r0, alpha, gain, half_min, SUM_min);
+        for m = 1:nm
+            v = V(m,:);
+            inv_ratio(is, m, in) = mean(~v);
+            if any(v)
+                e = Xh(m, v) - Xh_clean(m, v);
+                rms_valid(is, m, in) = sqrt(mean(e.^2));
+            end
+        end
+    end
+end
+
+figure('Name', 'Noise sweep', 'Position', [200 200 1000 400]);
+for in = 1:nN
+    subplot(1, nN, in);
+    semilogy(SNR_dB, rms_valid(:,:,in)*1e3, '-o', 'LineWidth', 1.2); grid on;
+    xlabel('SNR [dB] (SUM / σ_{quad})'); ylabel('valid RMS error [µm]');
+    title(sprintf('nSigma = %g, r_0 = %.1f mm', nSigma_list(in), r0_noise));
+    legend(methods, 'Location', 'best');
+end
+
+for in = 1:nN
+    fprintf('\n=== noise sweep, nSigma = %g, r0 = %.1f mm, |X| <= r0 ===\n', nSigma_list(in), r0_noise);
+    fprintf('%8s | %-30s | %s\n', 'SNR dB', 'valid RMS [µm]', 'invalid 비율 [%]');
+    fprintf('%8s | ', ''); fprintf('%10s', methods{:}); fprintf(' | '); fprintf('%10s', methods{:}); fprintf('\n');
+    for is = 1:nS
+        fprintf('%8d | ', SNR_dB(is)); fprintf('%10.2f', rms_valid(is,:,in)*1e3);
+        fprintf(' | '); fprintf('%10.1f', inv_ratio(is,:,in)*100); fprintf('\n');
+    end
+end
+
+%% ======================= local functions ==================================
+function [gain_raw, gain] = calibrate(beam, det, alpha, cal_frac)
+% 노이즈 없는 신호로 중심 근처 기울기를 구해 정규화 이득을 만든다.
+%   gain_raw(m) : 정규화 전 기울기
+%   gain(m)     : 곱하면 중심 기울기가 1이 되는 이득
+%                 DoS·LogRatio -> k [mm],  Hybrid -> 무차원 정규화 이득
+    xc = linspace(-cal_frac*beam.r0, cal_frac*beam.r0, 21);
+    sig = qpd_model(xc, zeros(size(xc)), beam, det);
+    [~, ~, d1] = estimator_dos(sig, 1);
+    [~, ~, d2] = estimator_logratio(sig, 1);
+    h = estimator_hybrid(sig, beam.r0, alpha);
+    p1 = polyfit(xc, d1, 1); p2 = polyfit(xc, d2, 1); p3 = polyfit(xc, h, 1);
+    gain_raw = [p1(1) p2(1) p3(1)];
+    gain = 1 ./ gain_raw;
+end
+
+function [Xh, V] = estimate_all(sig, r0, alpha, gain, half_min, SUM_min)
+% 3 x N 행렬: 정규화된 X 추정값과 valid 마스크 (행 = DoS, LogRatio, Hybrid)
+%   half_min, SUM_min 생략 시 0 (잡음 없는 비교용)
+    if nargin < 5, half_min = 0; end
+    if nargin < 6, SUM_min = 0; end
+    [x1, ~, ~, ~, v1] = estimator_dos(sig, gain(1), SUM_min);
+    [x2, ~, ~, ~, v2] = estimator_logratio(sig, gain(2), half_min);
+    [x3, ~, v3] = estimator_hybrid(sig, r0, alpha, half_min, SUM_min);
+    x3 = gain(3)*x3;
+    Xh = [x1(:).'; x2(:).'; x3(:).'];
+    V  = [v1(:).'; v2(:).'; v3(:).'];
+end
+
+function r = linear_range(x, xh, tol_rel)
+% 중심에서 바깥으로 |xh-x| <= tol_rel·|x| 가 연속으로 유지되는 최대 |x| (양쪽 중 작은 값)
+    ok = abs(xh - x) <= tol_rel*abs(x) | abs(x) < 1e-12;
+    r = min(edge_extent(x, ok, +1), edge_extent(x, ok, -1));
+end
+
+function r = slope_range(x, xh, slope_frac)
+% 중심에서 바깥으로 국부 기울기 >= slope_frac 가 연속으로 유지되는 최대 |x| (양쪽 중 작은 값)
+    ok = gradient(xh, x) >= slope_frac;
+    r = min(edge_extent(x, ok, +1), edge_extent(x, ok, -1));
+end
+
+function r = edge_extent(x, ok, dirn)
+    [~, i0] = min(abs(x));
+    idx = i0;
+    while true
+        nxt = idx + dirn;
+        if nxt < 1 || nxt > numel(x) || ~ok(nxt), break; end
+        idx = nxt;
+    end
+    r = abs(x(idx));
+end
+
+function print_table(r0_list, methods, M, fmt)
+    fprintf('%8s', 'r0 mm'); fprintf('%10s', methods{:}); fprintf('\n');
+    for i = 1:numel(r0_list)
+        fprintf('%8.1f', r0_list(i)); fprintf(fmt, M(i,:)); fprintf('\n');
+    end
+end
