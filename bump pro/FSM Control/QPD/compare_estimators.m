@@ -15,35 +15,38 @@ det.gap  = 0;      % [mm] 미확인 -> 0 (이상적 조건)
 det.resp = 0.4;    % [A/W] @633 nm
 det.G    = 1e4;    % [V/A]
 
-% 광원: Mirrorcle Dev Kit red diode laser, 635 nm, 5 mW (nominal), NE13A-A 사용
-% 실제 QPD 도달 파워는 E1에서 PM100D로 측정해 교체
+% 실제 QPD 도달 파워는 E1에서 파워미터로 측정해 교체
 P_laser  = 5e-3;                          % [W] nominal
-T_ND     = 10^(-1.3);                     % NE13A-A, OD 1.3 -> 투과율 약 5%
-R_mirror = 1;                             % 미러 반사 손실 미반영 (값 미확인)
-P_det      = P_laser*T_ND*R_mirror;       % [W] 약 0.25 mW
-SUM_target = P_det*det.resp*det.G;        % [V] 약 1.0 V (SNR 정의 기준으로도 사용)
+T_ND     = 10^(-1.3);                     % NE13A-A -> 투과율 약 5%
+R_mirror = 1;                             % 미러 반사 손실 미반영
+P_det      = P_laser*T_ND*R_mirror;       % PQD에 실제 도착하는 값
+SUM_target = P_det*det.resp*det.G;        % QPD에 빛이 얼마나 들어오는지 약 1.0 V 
 
 r0_list = [0.5 1.0 1.5 2.0];              % [mm] 1/e^2 빔 반경
 alpha   = 0.9;                            % Hybrid 가중치 (논문값)
 methods = {'DoS', 'LogRatio', 'Hybrid'};
 nm = numel(methods); nr = numel(r0_list);
 
-%% 2~3. calibration + 1D 오차 곡선
+
+%% 2~3. S2 핵심 결과(잡음 없을 때 세 추정기 비교)
 rng_out = estimator_ranges(r0_list, det, alpha);
 Xs = rng_out(1).Xs;
 o  = rng_out(1).opts;
 
 figure('Name', '1D estimation error', 'Position', [100 100 1100 750]);
 for ir = 1:nr
-    Xh = rng_out(ir).Xh;
-    subplot(2, 2, ir);
-    plot(Xs, Xh - Xs, 'LineWidth', 1.2);  grid on;
-    xlabel('X true [mm]'); ylabel('X_hat - X [mm]');
+    Xh  = rng_out(ir).Xh;
+    idx = abs(Xs) <= 2*r0_list(ir);                            % 표시 범위 |X| <= 2·r0
+    subplot(2, 2, ir); hold on;
+    plot(Xs(idx), Xh(:,idx), 'LineWidth', 1.2);  grid on;
+    plot(Xs(idx), Xs(idx), 'k--', 'HandleVisibility', 'off');  % 이상적 출력 X_hat = X
+    xlabel('X true [mm]'); ylabel('X_hat [mm]');
     title(sprintf('r_0 = %.1f mm', r0_list(ir)));
-    ylim([-1 1]*r0_list(ir)); xline(det.R, 'k:'); xline(-det.R, 'k:');
+    xlim([-2 2]*r0_list(ir)); xline(det.R, 'k:'); xline(-det.R, 'k:');
     if ir == 1, legend(methods, 'Location', 'best'); end
 end
 
+% 그래프
 fprintf('\n=== 원신호 중심 감도 dδ/dX [1/mm] ===\n');
 print_table(r0_list, methods, vertcat(rng_out.gain_raw), '%10.3f');
 fprintf('\n=== 선형 범위 |X| [mm] (상대오차 <= %.0f%%) ===\n', o.tol_rel*100);
@@ -52,7 +55,50 @@ fprintf('\n=== 감도 유지 범위 |X| [mm] (중심 감도의 %.0f%% 이상, %.
 print_table(r0_list, methods, vertcat(rng_out.slope_range), '%10.3f');
 fprintf('\n=== RMSE [mm], |X| <= r0 ===\n');
 print_table(r0_list, methods, vertcat(rng_out.rmse_r0), '%10.4f');
+%% 3-1. Hybrid α 비교 (잡음 없음)
+alpha_list = [0.9 0.8];                 % 비교할 α 값
+na = numel(alpha_list);
+rng_a = cell(1, na);
+for ia = 1:na
+    rng_a{ia} = estimator_ranges(r0_list, det, alpha_list(ia));
+end
 
+figure('Name', 'Hybrid alpha comparison', 'Position', [120 120 1100 750]);
+for ir = 1:nr
+    idx = abs(Xs) <= 2*r0_list(ir);                            % 표시 범위 |X| <= 2·r0
+    subplot(2, 2, ir); hold on; grid on;
+    Xh = rng_a{1}(ir).Xh;
+    plot(Xs(idx), Xh(2,idx), 'LineWidth', 1.2);                % LogRatio (α와 무관)
+    for ia = 1:na
+        Xh = rng_a{ia}(ir).Xh;
+        plot(Xs(idx), Xh(3,idx), 'LineWidth', 1.2);            % Hybrid
+    end
+    plot(Xs(idx), Xs(idx), 'k--', 'LineWidth', 1.0);           % 이상적 출력 y = x
+    xlabel('X true [mm]'); ylabel('X\_hat [mm]');
+    title(sprintf('r_0 = %.1f mm', r0_list(ir)));
+    xlim([-2 2]*r0_list(ir));
+    if ir == 1
+        legend([{'LogRatio'}, compose('Hybrid \\alpha = %.1f', alpha_list), {'y = x'}], ...
+            'Location', 'best');
+    end
+end
+
+% 선형 범위, RMSE 표 (열: LogRatio, Hybrid α별)
+lab_a  = [{'LogRatio'}, compose('Hyb a=%.1f', alpha_list)];
+M_lin  = zeros(nr, na+1);
+M_rmse = zeros(nr, na+1);
+for ir = 1:nr
+    M_lin(ir,1)  = rng_a{1}(ir).lin_range(2);
+    M_rmse(ir,1) = rng_a{1}(ir).rmse_r0(2);
+    for ia = 1:na
+        M_lin(ir,ia+1)  = rng_a{ia}(ir).lin_range(3);
+        M_rmse(ir,ia+1) = rng_a{ia}(ir).rmse_r0(3);
+    end
+end
+fprintf('\n=== [α 비교] 선형 범위 |X| [mm] (상대오차 <= %.0f%%) ===\n', o.tol_rel*100);
+print_table(r0_list, lab_a, M_lin, '%10.3f');
+fprintf('\n=== [α 비교] RMSE [mm], |X| <= r0 ===\n');
+print_table(r0_list, lab_a, M_rmse, '%10.4f');
 %% 4. Y 오프셋에 따른 X 추정 영향 (r0 = 1 mm)
 beam.r0 = 1.0; beam.P = P_det;
 gain = estimator_ranges(beam.r0, det, alpha).gain;
@@ -64,10 +110,11 @@ for m = 1:nm
     for iy = 1:numel(Yoff)
         sig = qpd_model(Xs, Yoff(iy)*ones(size(Xs)), beam, det);
         Xh  = estimate_all(sig, alpha, gain);
-        plot(Xs, Xh(m,:) - Xs, 'LineWidth', 1.1);
+        plot(Xs, Xh(m,:), 'LineWidth', 1.1);
     end
-    grid on; ylim([-1 1]);
-    xlabel('X true [mm]'); ylabel('X_hat - X [mm]');
+    plot(Xs, Xs, 'k--', 'HandleVisibility', 'off');            % 이상적 출력 X_hat = X
+    grid on; ylim([-1 1]*max(Xs));
+    xlabel('X true [mm]'); ylabel('X_hat [mm]');
     title(sprintf('%s, r_0 = %.1f mm', methods{m}, beam.r0));
     legend(compose('Y = %.1f mm', Yoff), 'Location', 'best');
 end

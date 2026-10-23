@@ -100,6 +100,8 @@ for ia = 1:na
     end
 end
 
+
+
 %% 4. 결과 출력 --------------------------------------------------------------
 fprintf('=== 1. 중심 Jacobian [mm/command] ===\n');
 fprintf('%6s %6s | %9s %9s %9s %9s | %18s\n', '입사각', 'L mm', 'dX/dux', 'dX/duy', 'dY/dux', 'dY/duy', '검산 (벡터/근사)');
@@ -180,7 +182,35 @@ for ia = 1:na
     title(sprintf('입사각 %.1f° (점선: X축 필요 최대 |u_x| = %.3f)', ...
               g.inc, u_fan));
 end
+%% FSM-QPD 변위 감도 비교 그래프
+figure('Color','w');
 
+for ax = 1:2
+    subplot(1,2,ax);
+    hold on;
+
+    for ia = 1:numel(inc_list)
+        sensitivity = abs(squeeze(J(ax,ax,ia,:)));
+
+        plot(L_list, sensitivity, '-o', ...
+            'LineWidth', 2, ...
+            'DisplayName', sprintf('%.1f°',inc_list(ia)));
+    end
+
+    xline(200,'k--','L = 200 mm');
+
+    xlabel('FSM-QPD distance [mm]');
+    ylabel('Displacement sensitivity [mm/command]');
+
+    if ax == 1
+        title('X-axis');
+    else
+        title('Y-axis');
+    end
+
+    legend('Location','best');
+    grid on;
+end
 %% ======================= local functions ==================================
 function [n0, f0] = nominal_frame(inc)
 % 테이블 좌표: z 위, 입사광 d = +y. 미러는 원점.

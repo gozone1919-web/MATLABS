@@ -14,7 +14,7 @@ function out = estimator_ranges(r0_list, det, alpha, opts)
     if nargin < 4 || isempty(opts), opts = struct(); end
     o.Xs         = getf(opts, 'Xs', linspace(-3.5, 3.5, 701));
     o.cal_frac   = getf(opts, 'cal_frac', 0.1);     % calibration 구간 |X| <= 0.1·r0
-    o.tol_rel    = getf(opts, 'tol_rel', 0.05);     % 선형 범위 기준 5%
+    o.tol_rel    = getf(opts, 'tol_rel', 0.01);     % 선형 범위 기준 5%
     o.slope_frac = getf(opts, 'slope_frac', 0.1);   % 감도 유지 기준 10%
 
     P  = 1/(det.resp*det.G);     % 잡음 없는 비율 계산이라 광량 무관 (SUM = 1 V)
